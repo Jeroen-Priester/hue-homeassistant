@@ -25,11 +25,28 @@ Hue Entertainment streaming.
    lights, areas or Hue rooms).
 
 **Usage**
-- Turn the toggle on to start and off to stop. By default, the lights turn off when it
-  stops.
+- Turn the toggle on to start and off to stop.
 - If Home Assistant restarts, or the automation is edited, while the toggle is on, the
   simulation resumes within 2 minutes.
-- Timing and look settings are in the collapsed sections of the automation.
+- Timing settings (shot length in ms, scene length in seconds) and look settings are in
+  the collapsed sections of the automation.
+
+**When stopped** — choose what happens when the toggle is turned off:
+- **Turn lights off** (default)
+- **Restore previous state**: the lights go back to how they were when the toggle was
+  turned on.
+  - Lights that were off are turned off again.
+  - Hue rooms and light groups are saved and restored per lamp, so stopping a 10-lamp
+    room sends a short burst of 10 bridge commands.
+  - The saved state is kept in memory only. If Home Assistant restarted while the
+    simulator was running, the lights are turned off instead.
+- **Leave as they are**
+
+> **Upgrading from the first version:** the scene length inputs were renamed and now use
+> seconds (`scene_min_s`/`scene_max_s`), and the "Turn lights off when stopped" toggle
+> became the **When stopped** choice. Existing automations fall back to the defaults for
+> these settings (2–8 min scenes, turn lights off). Set them again if you had changed
+> them.
 
 **Hue rate limits**
 - Individual lights: each light costs one bridge command per shot, and the bridge
@@ -38,4 +55,4 @@ Hue Entertainment streaming.
 - Hue rooms/zones: they take one command per shot but only about 1 command/s. Set the
   shortest shot to at least 1000 ms.
 
-Requires Home Assistant 2024.10 or newer.
+Requires Home Assistant 2026.6 or newer.
