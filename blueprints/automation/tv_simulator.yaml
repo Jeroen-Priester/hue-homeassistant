@@ -1,0 +1,187 @@
+blueprint:
+  name: TV Simulator
+  description: >-
+    Makes lights flicker like a TV is on (presence simulation). Modelled on
+    WLED's TV Simulator effect: minutes-long "scenes" with a base colour, short
+    "shots" that vary around it, random fades, and hard cuts.
+    Turn the chosen switch on to start and off to stop.
+  domain: automation
+  author: Jeroen-Priester
+  source_url: https://github.com/Jeroen-Priester/hue-homeassistant/blob/main/blueprints/automation/tv_simulator.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    devices:
+      name: Lights and switch
+      icon: mdi:television-classic
+      input:
+        enable_entity:
+          name: On/off switch
+          description: Toggle helper that starts (on) and stops (off) the simulation.
+          selector:
+            entity:
+              domain: input_boolean
+        target_light:
+          name: Lights
+          description: >-
+            Lights, areas or Hue rooms to drive. Each individual light is one
+            bridge command per shot; Hue bridges handle about 10 commands/s, so
+            keep (number of lights) / (shortest shot in s) under ~8.
+            Hue rooms/zones are one command per shot but are limited to about
+            1 command/s, so set the shortest shot to at least 1000 ms for them.
+          selector:
+            target:
+              entity:
+                domain: light
+    timing:
+      name: Timing
+      icon: mdi:timer-outline
+      collapsed: true
+      input:
+        shot_min:
+          name: Shortest shot
+          default: 800
+          selector:
+            number: {min: 200, max: 10000, step: 100, unit_of_measurement: ms, mode: box}
+        shot_max:
+          name: Longest shot
+          default: 3000
+          selector:
+            number: {min: 200, max: 20000, step: 100, unit_of_measurement: ms, mode: box}
+        scene_min:
+          name: Shortest scene
+          description: How long a "movie scene" with similar colours lasts.
+          default: 2
+          selector:
+            number: {min: 1, max: 60, unit_of_measurement: min, mode: box}
+        scene_max:
+          name: Longest scene
+          default: 8
+          selector:
+            number: {min: 1, max: 60, unit_of_measurement: min, mode: box}
+        cut_pct:
+          name: Hard cut chance
+          description: Share of changes that happen instantly instead of fading.
+          default: 30
+          selector:
+            number: {min: 0, max: 100, unit_of_measurement: "%", mode: slider}
+    look:
+      name: Look
+      icon: mdi:palette
+      collapsed: true
+      input:
+        sat_min:
+          name: Minimum colour saturation
+          default: 15
+          selector:
+            number: {min: 0, max: 100, unit_of_measurement: "%", mode: slider}
+        sat_max:
+          name: Maximum colour saturation
+          description: 0 = white only. WLED uses roughly 40–63%.
+          default: 45
+          selector:
+            number: {min: 0, max: 100, unit_of_measurement: "%", mode: slider}
+        bri_max:
+          name: Maximum brightness
+          description: Shots dip down to about 40% below this.
+          default: 80
+          selector:
+            number: {min: 5, max: 100, unit_of_measurement: "%", mode: slider}
+    stopping:
+      name: When stopped
+      icon: mdi:stop-circle-outline
+      collapsed: true
+      input:
+        turn_off_at_end:
+          name: Turn lights off when stopped
+          default: true
+          selector:
+            boolean: {}
+
+mode: restart
+
+variables:
+  enable_entity: !input enable_entity
+  turn_off_at_end: !input turn_off_at_end
+  shot_min: !input shot_min
+  shot_max: !input shot_max
+  scene_min: !input scene_min
+  scene_max: !input scene_max
+  cut_pct: !input cut_pct
+  sat_min: !input sat_min
+  sat_max: !input sat_max
+  bri_max: !input bri_max
+  shot_lo: "{{ [shot_min, shot_max] | min | int }}"
+  shot_hi: "{{ [shot_min, shot_max] | max | int }}"
+  scene_lo_s: "{{ ([scene_min, scene_max] | min * 60) | int }}"
+  scene_hi_s: "{{ ([scene_min, scene_max] | max * 60) | int }}"
+  sat_lo: "{{ [sat_min, sat_max] | min | int }}"
+  sat_hi: "{{ [sat_min, sat_max] | max | int }}"
+  dip_max: "{{ (bri_max * 0.4) | int }}"
+
+triggers:
+  - trigger: state
+    entity_id: !input enable_entity
+    to: "on"
+  - trigger: homeassistant
+    event: start
+  - trigger: time_pattern
+    minutes: "/2"
+    id: watchdog
+    note: >-
+      Restarts the simulation if the switch is on but nothing is running,
+      e.g. after this automation was edited/reloaded mid-run.
+
+conditions:
+  - condition: state
+    entity_id: !input enable_entity
+    state: "on"
+  - or:
+      - not:
+          - condition: trigger
+            id: watchdog
+      - "{{ state_attr(this.entity_id, 'current') | int(0) == 0 }}"
+    note: The watchdog must never restart a healthy run (mode restart would cut it).
+
+actions:
+  - repeat:
+      while:
+        - condition: state
+          entity_id: !input enable_entity
+          state: "on"
+      sequence:
+        - variables:
+            scene_hue: "{{ range(0, 360) | random }}"
+            scene_sat: "{{ range(sat_lo, sat_hi + 1) | random }}"
+            scene_bri: "{{ (bri_max * (range(75, 101) | random) / 100) | round(1) }}"
+            scene_end: "{{ as_timestamp(now()) + (range(scene_lo_s, scene_hi_s + 1) | random) }}"
+          note: New "movie scene" - base colour the shots vary around.
+        - repeat:
+            while:
+              - condition: state
+                entity_id: !input enable_entity
+                state: "on"
+              - "{{ as_timestamp(now()) < scene_end }}"
+            sequence:
+              - variables:
+                  shot_ms: "{{ range(shot_lo, shot_hi + 1) | random }}"
+                  is_cut: "{{ (range(0, 100) | random) < cut_pct }}"
+                  fade_s: "{{ 0 if is_cut else ((range(0, shot_ms) | random) / 1000) | round(1) }}"
+                  shot_hue: "{{ (scene_hue + (range(-20, 21) | random)) % 360 }}"
+                  shot_sat: "{{ [scene_sat - (range(0, 11) | random), 0] | max }}"
+                  shot_bri: "{{ [scene_bri - (range(0, dip_max + 1) | random), 1] | max }}"
+              - action: light.turn_on
+                target: !input target_light
+                data:
+                  hs_color: ["{{ shot_hue }}", "{{ shot_sat }}"]
+                  brightness_pct: "{{ shot_bri }}"
+                  transition: "{{ fade_s }}"
+                continue_on_error: true
+                note: One lamp failing (e.g. unavailable) must not stop the simulation.
+              - delay:
+                  milliseconds: "{{ shot_ms }}"
+  - if:
+      - "{{ turn_off_at_end }}"
+    then:
+      - action: light.turn_off
+        target: !input target_light
