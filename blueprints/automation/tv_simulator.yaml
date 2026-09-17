@@ -9,7 +9,7 @@ blueprint:
   author: Jeroen-Priester
   source_url: https://github.com/Jeroen-Priester/hue-homeassistant/blob/main/blueprints/automation/tv_simulator.yaml
   homeassistant:
-    min_version: "2024.10.0"
+    min_version: "2026.6.0"
   input:
     devices:
       name: Lights and switch
@@ -48,17 +48,17 @@ blueprint:
           default: 3000
           selector:
             number: {min: 200, max: 20000, step: 100, unit_of_measurement: ms, mode: box}
-        scene_min:
+        scene_min_s:
           name: Shortest scene
           description: How long a "movie scene" with similar colours lasts.
-          default: 2
+          default: 120
           selector:
-            number: {min: 1, max: 60, unit_of_measurement: min, mode: box}
-        scene_max:
+            number: {min: 5, max: 3600, unit_of_measurement: s, mode: box}
+        scene_max_s:
           name: Longest scene
-          default: 8
+          default: 480
           selector:
-            number: {min: 1, max: 60, unit_of_measurement: min, mode: box}
+            number: {min: 5, max: 3600, unit_of_measurement: s, mode: box}
         cut_pct:
           name: Hard cut chance
           description: Share of changes that happen instantly instead of fading.
@@ -92,37 +92,79 @@ blueprint:
       icon: mdi:stop-circle-outline
       collapsed: true
       input:
-        turn_off_at_end:
-          name: Turn lights off when stopped
-          default: true
+        stop_action:
+          name: When the switch is turned off
+          description: >-
+            "Restore" puts the lights back the way they were when the switch was
+            turned on (lights that were off are turned off again). If Home
+            Assistant restarted in between, the saved state is gone and the
+            lights are turned off instead.
+          default: turn_off
           selector:
-            boolean: {}
+            select:
+              options:
+                - label: Turn lights off
+                  value: turn_off
+                - label: Restore previous state
+                  value: restore
+                - label: Leave as they are
+                  value: leave
 
 mode: restart
 
 variables:
   enable_entity: !input enable_entity
-  turn_off_at_end: !input turn_off_at_end
+  target_light: !input target_light
+  stop_action: !input stop_action
   shot_min: !input shot_min
   shot_max: !input shot_max
-  scene_min: !input scene_min
-  scene_max: !input scene_max
+  scene_min_s: !input scene_min_s
+  scene_max_s: !input scene_max_s
   cut_pct: !input cut_pct
   sat_min: !input sat_min
   sat_max: !input sat_max
   bri_max: !input bri_max
   shot_lo: "{{ [shot_min, shot_max] | min | int }}"
   shot_hi: "{{ [shot_min, shot_max] | max | int }}"
-  scene_lo_s: "{{ ([scene_min, scene_max] | min * 60) | int }}"
-  scene_hi_s: "{{ ([scene_min, scene_max] | max * 60) | int }}"
+  scene_lo_s: "{{ [scene_min_s, scene_max_s] | min | int }}"
+  scene_hi_s: "{{ [scene_min_s, scene_max_s] | max | int }}"
   sat_lo: "{{ [sat_min, sat_max] | min | int }}"
   sat_hi: "{{ [sat_min, sat_max] | max | int }}"
   dip_max: "{{ (bri_max * 0.4) | int }}"
+  snapshot_id: "tv_sim_{{ this.entity_id.split('.')[1] }}"
+  snapshot_scene: "scene.{{ snapshot_id }}"
+  light_ids: >-
+    {#- Resolve the target (entities/areas/devices/labels/floors) to light
+       entities; groups such as Hue rooms are replaced by their members
+       (one level deep). -#}
+    {%- set ns = namespace(ids=[], out=[]) -%}
+    {%- for key in ['entity_id', 'area_id', 'device_id', 'label_id', 'floor_id'] -%}
+      {%- set vals = target_light.get(key, []) -%}
+      {%- set vals = [vals] if vals is string else vals -%}
+      {%- for v in vals -%}
+        {%- if key == 'entity_id' -%}{%- set ns.ids = ns.ids + [v] -%}
+        {%- elif key == 'area_id' -%}{%- set ns.ids = ns.ids + area_entities(v) -%}
+        {%- elif key == 'device_id' -%}{%- set ns.ids = ns.ids + device_entities(v) -%}
+        {%- elif key == 'label_id' -%}{%- set ns.ids = ns.ids + label_entities(v) -%}
+        {%- else -%}{%- for a in floor_areas(v) -%}{%- set ns.ids = ns.ids + area_entities(a) -%}{%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endfor -%}
+    {%- for i in ns.ids -%}
+      {%- set members = state_attr(i, 'entity_id') -%}
+      {%- if members is not none and members is not string -%}
+        {%- set ns.out = ns.out + (members | list) -%}
+      {%- else -%}
+        {%- set ns.out = ns.out + [i] -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ ns.out | select('match', 'light\\.') | unique | list }}
 
 triggers:
   - trigger: state
     entity_id: !input enable_entity
     to: "on"
+    id: switched_on
   - trigger: homeassistant
     event: start
   - trigger: time_pattern
@@ -144,6 +186,20 @@ conditions:
     note: The watchdog must never restart a healthy run (mode restart would cut it).
 
 actions:
+  - if:
+      - "{{ stop_action == 'restore' }}"
+      - condition: trigger
+        id: switched_on
+      - "{{ states.scene | selectattr('entity_id', 'eq', snapshot_scene) | list | count == 0 }}"
+    then:
+      - action: scene.create
+        data:
+          scene_id: "{{ snapshot_id }}"
+          snapshot_entities: "{{ light_ids }}"
+        continue_on_error: true
+    note: >-
+      Snapshot only on a real switch-on and only if none exists yet, so a
+      watchdog restart, reload or quick off/on never saves flicker colours.
   - repeat:
       while:
         - condition: state
@@ -180,8 +236,29 @@ actions:
                 note: One lamp failing (e.g. unavailable) must not stop the simulation.
               - delay:
                   milliseconds: "{{ shot_ms }}"
-  - if:
-      - "{{ turn_off_at_end }}"
-    then:
-      - action: light.turn_off
-        target: !input target_light
+  - choose:
+      - conditions:
+          - "{{ stop_action == 'restore' }}"
+          - "{{ states.scene | selectattr('entity_id', 'eq', snapshot_scene) | list | count > 0 }}"
+        sequence:
+          - action: scene.turn_on
+            target:
+              entity_id: "{{ snapshot_scene }}"
+            data:
+              transition: 1
+            continue_on_error: true
+          - delay:
+              seconds: 1.5
+            note: >-
+              Keep the snapshot until the restore has finished, so a quick
+              off/on (which restarts this run here) reuses it instead of
+              snapshotting a half-restored state.
+          - action: scene.delete
+            target:
+              entity_id: "{{ snapshot_scene }}"
+            continue_on_error: true
+      - conditions:
+          - "{{ stop_action in ['turn_off', 'restore'] }}"
+        sequence:
+          - action: light.turn_off
+            target: !input target_light
